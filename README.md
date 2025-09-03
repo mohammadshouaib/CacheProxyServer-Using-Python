@@ -1,5 +1,5 @@
 # Cache-Proxy-Server-Using-Python
-A Python-based caching proxy server that forwards HTTP requests between clients and target servers. Includes features like caching, request logging, blacklist/whitelist filtering, and concurrent connections. Bonus features include HTTPS support, SSL/TLS decryption for debugging, and an optional web-based admin interface.
+A Python-based caching proxy server that forwards HTTP requests between clients and target servers. Includes features like caching, request logging, blacklist/whitelist filtering, and concurrent connections. And a web-based admin interface.
 
 
 # Caching Proxy Server
@@ -7,7 +7,6 @@ A Python-based caching proxy server that forwards HTTP requests between clients 
 ## 📖 Description
 This project implements a caching proxy server in Python. The proxy server forwards requests from clients to target servers, relays back responses, and enhances performance through caching. It also provides features such as logging, request filtering (blacklist/whitelist), and concurrent client handling.
 
-Additional bonus features include HTTPS support, SSL/TLS decryption (MITM), and a web-based admin interface for managing the proxy.
 
 ---
 
@@ -66,8 +65,9 @@ Web-based interface to:
 ## 🛠️ Requirements
 - Python 3.8+
 - Standard libraries: `socket`, `threading`, `logging`, `datetime`
+- SQLite3
 - (Optional) `ssl` for HTTPS MITM
-- (Optional) `flask` or `fastapi` for the admin interface
+- (Optional) `Streamlit` + `panda` for the admin interface
 
 ---
 
@@ -81,6 +81,17 @@ proxy-server/
 
 
 ---
+
+## TO DO LIST
+- Scale up and use SQL DB
+- Make the logging cleaner
+- Work on Interface.py to make it more pro
+- Additional bonus features include HTTPS support, SSL/TLS decryption (MITM), and a web-based admin interface for managing the proxy.
+  
+
+
+---
+
 
 ## ▶️ Usage
 
