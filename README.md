@@ -73,11 +73,11 @@ Web-based interface to:
 
 ## 📂 Project Structure
 proxy-server/
-│── proxy.py # Main proxy server implementation
-│── cache/ # Cache storage (if file-based caching used)
-│── logs/ # Log files
-│── config.json # Configuration file (blacklist/whitelist, cache settings, etc.)
-│── README.md # Project documentation
+- │── proxy.py # Main proxy server implementation
+- │── cache/ # Cache storage (if file-based caching used)
+- │── logs/ # Log files
+- │── config.json # Configuration file (blacklist/whitelist, cache settings, etc.)
+- │── README.md # Project documentation
 
 
 ---
