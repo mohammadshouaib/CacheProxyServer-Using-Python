@@ -1,118 +1,88 @@
-import streamlit as st
-import sqlite3
+"""Streamlit admin dashboard.
+
+Fixes: parameterized queries (no SQL injection), a Clear Cache button that
+actually clears the file/memory cache instead of a non-existent table, and
+management for BOTH blacklist and whitelist plus richer stats.
+
+Run with:  streamlit run interface.py
+"""
 import pandas as pd
+import streamlit as st
 
-# Connect to SQLite database
-def get_db_connection():
-    try:
-        conn = sqlite3.connect("proxy_logs.db")
-        return conn
-    except sqlite3.Error as e:
-        st.error(f"Database connection failed: {e}")
-        return None
+import cache as cachelib
+import config
+import filtering
+import logs
 
-# Fetch logs from the database
-def get_logs():
-    conn = get_db_connection()
-    if conn:
-        try:
-            logs = pd.read_sql_query("SELECT * FROM requests", conn)
-            conn.close()
-            return logs
-        except sqlite3.Error as e:
-            st.error(f"Failed to fetch logs: {e}")
-    return pd.DataFrame()
+cfg = config.load_config()
+logs.configure(cfg["db_name"])
 
-# Fetch response logs
-def get_response_logs():
-    conn = get_db_connection()
-    if conn:
-        try:
-            logs = pd.read_sql_query("SELECT * FROM responses", conn)
-            conn.close()
-            return logs
-        except sqlite3.Error as e:
-            st.error(f"Failed to fetch response logs: {e}")
-    return pd.DataFrame()
 
-# Fetch filters (blacklist/whitelist)
-def get_filters(filter_type):
-    conn = get_db_connection()
-    if conn:
-        try:
-            filters = pd.read_sql_query(f"SELECT * FROM filters WHERE type = '{filter_type}'", conn)
-            conn.close()
-            return filters
-        except sqlite3.Error as e:
-            st.error(f"Failed to fetch {filter_type} list: {e}")
-    return pd.DataFrame()
+def df(sql, params=()):
+    rows = logs.query(sql, params)
+    return pd.DataFrame([dict(r) for r in rows])
 
-# Add or remove filters
-def modify_filter(domain, filter_type, action):
-    conn = get_db_connection()
-    if conn:
-        try:
-            if action == "add":
-                conn.execute("INSERT INTO filters (address, type) VALUES (?, ?)", (domain, filter_type))
-            elif action == "remove":
-                conn.execute("DELETE FROM filters WHERE address = ? AND type = ?", (domain, filter_type))
-            conn.commit()
-            conn.close()
-            st.success(f"{'Added' if action == 'add' else 'Removed'} {domain} from {filter_type}.")
-        except sqlite3.Error as e:
-            st.error(f"Failed to modify {filter_type}: {e}")
 
-# Clear cache
-def clear_cache():
-    conn = get_db_connection()
-    if conn:
-        try:
-            conn.execute("DELETE FROM cache")
-            conn.commit()
-            conn.close()
-            st.success("Cache cleared.")
-        except sqlite3.Error as e:
-            st.error(f"Failed to clear cache: {e}")
-
-# Streamlit UI
 st.title("Proxy Server Admin Dashboard")
-st.sidebar.header("Navigation")
-option = st.sidebar.selectbox("Choose action", ["View Logs", "Manage Blacklist/Whitelist", "Cache Management", "Statistics"])
+option = st.sidebar.selectbox(
+    "Choose action",
+    ["View Logs", "Manage Filters", "Cache Management", "Statistics"],
+)
 
 if option == "View Logs":
     st.header("Request Logs")
-    logs = get_logs()
-    if not logs.empty:
-        st.dataframe(logs)
-    else:
-        st.info("No logs available.")
+    requests = df("SELECT * FROM requests ORDER BY id DESC LIMIT 500")
+    st.dataframe(requests if not requests.empty else pd.DataFrame())
 
     st.header("Response Logs")
-    response_logs = get_response_logs()
-    if not response_logs.empty:
-        st.dataframe(response_logs)
-    else:
-        st.info("No response logs available.")
+    responses = df("SELECT * FROM responses ORDER BY id DESC LIMIT 500")
+    st.dataframe(responses if not responses.empty else pd.DataFrame())
 
-elif option == "Manage Blacklist/Whitelist":
-    st.header("Blacklist Management")
-    blacklist = get_filters("blacklist")
-    st.dataframe(blacklist if not blacklist.empty else "No blacklist entries.")
+elif option == "Manage Filters":
+    list_type = st.radio("List", ["blacklist", "whitelist"], horizontal=True)
+    st.caption(f"Active filter mode in config: **{cfg['filter_mode']}**")
 
-    new_domain = st.text_input("Add to Blacklist:")
-    if st.button("Add to Blacklist"):
-        modify_filter(new_domain, "blacklist", "add")
+    current = df("SELECT address FROM filters WHERE type = ?", (list_type,))
+    st.dataframe(current if not current.empty else pd.DataFrame())
 
-    domain_to_remove = st.text_input("Remove from Blacklist:")
-    if st.button("Remove from Blacklist"):
-        modify_filter(domain_to_remove, "blacklist", "remove")
+    domain = st.text_input(f"Domain to add/remove ({list_type})")
+    col_add, col_remove = st.columns(2)
+    if col_add.button("Add") and domain:
+        filtering.add_to_filter_list(domain.strip(), list_type)
+        st.success(f"Added {domain} to {list_type}.")
+        st.rerun()
+    if col_remove.button("Remove") and domain:
+        filtering.remove_from_filter_list(domain.strip(), list_type)
+        st.success(f"Removed {domain} from {list_type}.")
+        st.rerun()
 
 elif option == "Cache Management":
     st.header("Cache Management")
+    st.write(f"Backend: **{cfg['cache']['backend']}**")
     if st.button("Clear Cache"):
-        clear_cache()
+        cachelib.build_cache(cfg).clear()
+        st.success("Cache cleared.")
 
 elif option == "Statistics":
     st.header("Statistics")
-    logs = get_logs()
-    st.metric("Total Requests", len(logs))
+    total = df("SELECT COUNT(*) AS n FROM requests")
+    hits = df("SELECT COUNT(*) AS n FROM responses WHERE cache_status = 'HIT'")
+    misses = df("SELECT COUNT(*) AS n FROM responses WHERE cache_status = 'MISS'")
+    n_total = int(total["n"][0]) if not total.empty else 0
+    n_hits = int(hits["n"][0]) if not hits.empty else 0
+    n_misses = int(misses["n"][0]) if not misses.empty else 0
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total Requests", n_total)
+    c2.metric("Cache Hits", n_hits)
+    served = n_hits + n_misses
+    c3.metric("Hit Rate", f"{(100 * n_hits / served):.1f}%" if served else "—")
+
+    top = df(
+        """SELECT target_host, COUNT(*) AS requests
+           FROM requests GROUP BY target_host
+           ORDER BY requests DESC LIMIT 10"""
+    )
+    if not top.empty:
+        st.subheader("Top hosts")
+        st.bar_chart(top.set_index("target_host"))

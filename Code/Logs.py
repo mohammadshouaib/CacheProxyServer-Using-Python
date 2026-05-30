@@ -1,160 +1,139 @@
-import sqlite3
+"""SQLite-backed request/response logging.
+
+Keeps the original schema but adds: a read helper (`query`), a way to fill in
+the request's final status, an index on responses.request_id, and a proper
+docstring placement. WAL mode + retry handle concurrent writes from threads.
+"""
 import logging
+import sqlite3
 import time
 from datetime import datetime
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-DB_NAME = 'proxy_logs.db'
+DB_NAME = "proxy_logs.db"
 MAX_RETRIES = 5
-RETRY_DELAY = 0.1  # 100 ms
+RETRY_DELAY = 0.1  # seconds
 
 
-# Enable Write-Ahead Logging (WAL) mode for SQLite
-def enable_wal_mode():
-    """
-    Enables WAL mode to allow concurrent reads and writes.
-    """
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("PRAGMA journal_mode=WAL;")
-    conn.close()
-    logging.info("WAL mode enabled for the SQLite database.")
+def configure(db_name):
+    global DB_NAME
+    DB_NAME = db_name
 
 
-# Get a database connection
 def get_db_connection():
-    """
-    Returns a new database connection.
-    """
     return sqlite3.connect(DB_NAME, check_same_thread=False)
 
 
-# Execute queries with retry logic
-def execute_with_retry(query, params=()):
-    """
-    Executes a database query with retry logic to handle transient database locks.
-    """
-    retries = 0
-    while retries < MAX_RETRIES:
+def execute_with_retry(query_sql, params=()):
+    """Run a write query, retrying briefly on transient 'database is locked'."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        conn = None
         try:
             conn = get_db_connection()
             cursor = conn.cursor()
-            cursor.execute(query, params)
+            cursor.execute(query_sql, params)
             conn.commit()
-            row_id = cursor.lastrowid
-            conn.close()
-            return row_id
+            return cursor.lastrowid
         except sqlite3.OperationalError as e:
             if "database is locked" in str(e):
-                retries += 1
+                logging.warning("DB locked, retry %s/%s", attempt, MAX_RETRIES)
                 time.sleep(RETRY_DELAY)
-                logging.warning(f"Retrying due to database lock... ({retries}/{MAX_RETRIES})")
-            else:
-                raise
+                continue
+            raise
         finally:
-            try:
+            if conn is not None:
                 conn.close()
-            except NameError:
-                pass
-    logging.error("Max retries reached. Operation failed.")
+    logging.error("Max retries reached; write failed.")
     return None
 
 
-# Initialize the database and create tables
-def init_db():
-    # Enable WAL mode during initialization
-    enable_wal_mode()
-    """
-    Creates the required database tables if they do not exist.
-    """
-    queries = [
-        '''
-        CREATE TABLE IF NOT EXISTS requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp DATETIME NOT NULL,
-            client_ip TEXT NOT NULL,
-            client_port INTEGER NOT NULL,
-            target_host TEXT NOT NULL,
-            target_port INTEGER NOT NULL,
-            method TEXT NOT NULL,
-            url TEXT NOT NULL,
-            protocol TEXT NOT NULL,
-            status INTEGER,
-            error_message TEXT
-        )
-        ''',
-        '''
-        CREATE TABLE IF NOT EXISTS responses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            request_id INTEGER NOT NULL,
-            timestamp DATETIME NOT NULL,
-            cache_status TEXT CHECK(cache_status IN ('HIT', 'MISS')),
-            response_status INTEGER,
-            response_content_type TEXT,
-            response_size INTEGER,
-            response_time_ms INTEGER,
-            FOREIGN KEY(request_id) REFERENCES requests(id)
-        )
-        ''',
-        '''
-        CREATE TABLE IF NOT EXISTS filters (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            address TEXT NOT NULL,
-            type TEXT NOT NULL CHECK (type IN ('blacklist', 'whitelist'))
-        )
-        ''',
-    ]
-
+def query(query_sql, params=()):
+    """Run a read query and return a list of sqlite3.Row."""
+    conn = get_db_connection()
     try:
-        conn = get_db_connection()
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        for query in queries:
-            cursor.execute(query)
-        conn.commit()
-        logging.info("Database initialized successfully.")
-    except Exception as e:
-        logging.error(f"Error initializing database: {e}")
+        cursor.execute(query_sql, params)
+        return cursor.fetchall()
     finally:
         conn.close()
 
 
-# Log a request
-def log_request(client_ip, client_port, target_host, target_port, method, url, protocol, error_message=None):
-    """
-    Logs a client request into the requests table.
-    """
-    query = """
-        INSERT INTO requests (timestamp, client_ip, client_port, target_host, target_port, method, url, protocol, error_message)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """
-    params = (datetime.now(), client_ip, client_port, target_host, target_port, method, url, protocol, error_message)
-    logging.info("Logging request to database.")
-    request_id = execute_with_retry(query, params)
-    if request_id:
-        logging.info(f"Request logged successfully with ID {request_id}.")
-    else:
-        logging.error("Failed to log request.")
-    return request_id
+def init_db():
+    """Create tables/indexes and enable WAL for concurrent read+write."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL;")
+        cursor.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp DATETIME NOT NULL,
+                client_ip TEXT NOT NULL,
+                client_port INTEGER NOT NULL,
+                target_host TEXT NOT NULL,
+                target_port INTEGER NOT NULL,
+                method TEXT NOT NULL,
+                url TEXT NOT NULL,
+                protocol TEXT NOT NULL,
+                status INTEGER,
+                error_message TEXT
+            );
+            CREATE TABLE IF NOT EXISTS responses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id INTEGER NOT NULL,
+                timestamp DATETIME NOT NULL,
+                cache_status TEXT CHECK(cache_status IN ('HIT', 'MISS')),
+                response_status INTEGER,
+                response_content_type TEXT,
+                response_size INTEGER,
+                response_time_ms INTEGER,
+                FOREIGN KEY(request_id) REFERENCES requests(id)
+            );
+            CREATE TABLE IF NOT EXISTS filters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                address TEXT NOT NULL,
+                type TEXT NOT NULL CHECK (type IN ('blacklist', 'whitelist'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_responses_request_id
+                ON responses(request_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_filters_unique
+                ON filters(address, type);
+            """
+        )
+        conn.commit()
+        logging.info("Database initialized.")
+    finally:
+        conn.close()
 
 
-# Log a response
-def log_response(request_id, cache_status, response_status, content_type, response_size, response_time_ms):
-    """
-    Logs a response associated with a request into the responses table.
-    """
-    query = """
-        INSERT INTO responses (request_id, timestamp, cache_status, response_status, response_content_type, response_size, response_time_ms)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """
-    params = (request_id, datetime.now(), cache_status, response_status, content_type, response_size, response_time_ms)
-    logging.info("Logging response to database.")
-    result = execute_with_retry(query, params)
-    if result:
-        logging.info("Response logged successfully.")
-    else:
-        logging.error("Failed to log response.")
+def log_request(client_ip, client_port, target_host, target_port,
+                method, url, protocol, error_message=None):
+    return execute_with_retry(
+        """INSERT INTO requests
+           (timestamp, client_ip, client_port, target_host, target_port,
+            method, url, protocol, error_message)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (datetime.now(), client_ip, client_port, target_host, target_port,
+         method, url, protocol, error_message),
+    )
 
 
+def update_request_status(request_id, status):
+    if request_id is None:
+        return
+    execute_with_retry(
+        "UPDATE requests SET status = ? WHERE id = ?", (status, request_id)
+    )
 
+
+def log_response(request_id, cache_status, response_status, content_type,
+                 response_size, response_time_ms):
+    execute_with_retry(
+        """INSERT INTO responses
+           (request_id, timestamp, cache_status, response_status,
+            response_content_type, response_size, response_time_ms)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (request_id, datetime.now(), cache_status, response_status,
+         content_type, response_size, int(response_time_ms)),
+    )
